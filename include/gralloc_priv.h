@@ -73,7 +73,7 @@ struct private_handle_t {
     enum {
         PRIV_FLAGS_FRAMEBUFFER = 0x00000001,
         PRIV_FLAGS_USES_UMP    = 0x00000002,
-        PRIV_FLAGS_USES_ION    = 0x00000020
+        PRIV_FLAGS_USES_ION    = 0x00000004
     };
 
     // file-descriptors
@@ -153,6 +153,11 @@ struct private_handle_t {
     }
     ~private_handle_t() {
         magic = 0;
+    }
+
+    bool usesPhysicallyContiguousMemory()
+    {
+        return (flags & PRIV_FLAGS_FRAMEBUFFER) ? true : false;
     }
 
     static int validate(const native_handle* h) {
