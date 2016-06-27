@@ -52,7 +52,11 @@ inline size_t roundUpToPageSize(size_t x) {
 
 // numbers of buffers for page flipping
 #define NUM_BUFFERS 2
-#define HWC_EXIST 1
+
+enum
+{
+    PAGE_FLIP = 0x00000001,
+};
 
 struct hwc_callback_entry
 {
@@ -65,6 +69,51 @@ typedef android::Vector<struct hwc_callback_entry> hwc_callback_queue_t;
 struct fb_context_t {
     framebuffer_device_t  device;
 };
+
+/*****************************************************************************/
+
+/*
+ * Copy buffer to the front if page flip is not available/allowed because of
+ * size constraints.
+ */
+inline void memcpy_buffer(private_module_t* m, private_handle_t const* hnd,
+                           buffer_handle_t &buffer) {
+    void* fb_vaddr;
+    void* buffer_vaddr;
+    
+    m->base.lock(&m->base, m->framebuffer, GRALLOC_USAGE_SW_WRITE_RARELY,
+                 0, 0, m->info.xres, m->info.yres, &fb_vaddr);
+    
+    m->base.lock(&m->base, buffer, GRALLOC_USAGE_SW_READ_RARELY,
+                 0, 0, m->info.xres, m->info.yres, &buffer_vaddr);
+    
+    // If buffer's alignment match framebuffer alignment we can do a direct copy.
+    // If not we must fallback to do an aligned copy of each line.
+#if 0
+    if (hnd->byte_stride == (int)m->finfo.line_length)
+    {
+        memcpy(fb_vaddr, buffer_vaddr, m->finfo.line_length * m->info.yres);
+    } else {
+        uintptr_t fb_offset = 0;
+        uintptr_t buffer_offset = 0;
+        unsigned int i;
+        
+        for (i = 0; i < m->info.yres; i++)
+        {
+            memcpy((void *)((uintptr_t)fb_vaddr + fb_offset),
+                   (void *)((uintptr_t)buffer_vaddr + buffer_offset),
+                   m->finfo.line_length);
+            
+            fb_offset += m->finfo.line_length;
+            buffer_offset += hnd->byte_stride;
+        }
+    }
+#else
+    memcpy(fb_vaddr, buffer_vaddr, m->finfo.line_length * m->info.yres);
+#endif
+    m->base.unlock(&m->base, buffer); 
+    m->base.unlock(&m->base, m->framebuffer);
+}
 
 /*****************************************************************************/
 
@@ -93,44 +142,37 @@ static int fb_setSwapInterval(struct framebuffer_device_t* dev,
 
 static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
 {
+    bool page_flip_allowed = true;
+
     if (private_handle_t::validate(buffer) < 0)
         return -EINVAL;
 
     private_handle_t const* hnd = reinterpret_cast<private_handle_t const*>(buffer);
     private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
-#if HWC_EXIST
-    hwc_callback_queue_t *queue = reinterpret_cast<hwc_callback_queue_t *>(m->queue);
-    pthread_mutex_lock(&m->queue_lock);
-    if(queue->isEmpty())
-        pthread_mutex_unlock(&m->queue_lock);
-    else {
-        private_handle_t *hnd = private_handle_t::dynamicCast(buffer);
-        struct hwc_callback_entry entry = queue->top();
-        queue->pop();
-        pthread_mutex_unlock(&m->queue_lock);
-        entry.callback(entry.data, hnd);
+
+    if (hnd->flags & ~PAGE_FLIP) {
+        page_flip_allowed = false;
+        ALOGW("%s: page flipping %s", page_flip_allowed ? " allowed" : " not allowed");
     }
-#else
-    // If we can't do the page_flip, just copy the buffer to the front
-    // FIXME: use copybit HAL instead of memcpy
-    void* fb_vaddr;
-    void* buffer_vaddr;
 
-    m->base.lock(&m->base, m->framebuffer,
-            GRALLOC_USAGE_SW_WRITE_RARELY,
-            0, 0, m->info.xres, m->info.yres,
-            &fb_vaddr);
+    if (page_flip_allowed) {
+        hwc_callback_queue_t *queue = reinterpret_cast<hwc_callback_queue_t *>(m->queue);
+        pthread_mutex_lock(&m->queue_lock);
+        if(queue->isEmpty())
+            pthread_mutex_unlock(&m->queue_lock);
+        else {
+            private_handle_t *hnd = private_handle_t::dynamicCast(buffer);
+            struct hwc_callback_entry entry = queue->top();
+            queue->pop();
+            pthread_mutex_unlock(&m->queue_lock);
+            entry.callback(entry.data, hnd);
+        }
+    } else {
+        // If we can't do the page_flip, just copy the buffer to the front
+        // FIXME: use copybit HAL instead of memcpy
+        memcpy_buffer(m, hnd, buffer);
+    }
 
-    m->base.lock(&m->base, buffer,
-            GRALLOC_USAGE_SW_READ_RARELY,
-            0, 0, m->info.xres, m->info.yres,
-            &buffer_vaddr);
-
-    memcpy(fb_vaddr, buffer_vaddr, m->finfo.line_length * m->info.yres);
-
-    m->base.unlock(&m->base, buffer);
-    m->base.unlock(&m->base, m->framebuffer);
-#endif
     return 0;
 }
 
@@ -176,6 +218,28 @@ int init_fb(struct private_module_t* module)
         return -errno;
     }
 
+    /*
+     * Request NUM_BUFFERS screens (at lest 2 for page flipping)
+     */
+    info.yres_virtual = info.yres * NUM_BUFFERS;
+
+    uint32_t flags = PAGE_FLIP;
+    if (ioctl(fd, FBIOPUT_VSCREENINFO, &info) == -1)
+    {
+        info.yres_virtual = info.yres;
+        flags &= ~PAGE_FLIP;
+        ALOGW("FBIOPUT_VSCREENINFO failed, page flipping not supported fd: %d", fd );
+    }
+
+    if (info.yres_virtual < info.yres * 2)
+    {
+        // we need at least 2 for page-flipping
+        info.yres_virtual = info.yres;
+        flags &= ~PAGE_FLIP;
+        ALOGW("page flipping not supported (yres_virtual=%d, requested=%d)",
+              info.yres_virtual, info.yres*2 );
+    }
+
     int refreshRate = 1000000000000000LLU /
         (
          uint64_t( info.upper_margin + info.lower_margin + info.vsync_len + info.yres )
@@ -199,6 +263,7 @@ int init_fb(struct private_module_t* module)
           finfo.id, info.xres, info.yres, info.width,  xdpi, info.height, ydpi,
           fps);
 
+    module->flags = flags;
     module->xres = info.xres;
     module->yres = info.yres;
     module->line_length = info.xres;

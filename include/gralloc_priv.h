@@ -82,6 +82,7 @@ struct private_handle_t {
     int     fd2;
     // ints
     int     magic;
+    int     byte_stride;
     int     flags;
     int     size;
     int     offset;
