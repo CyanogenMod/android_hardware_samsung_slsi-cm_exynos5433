@@ -40,6 +40,7 @@
 #endif
 
 #include "gralloc_priv.h"
+#include "gralloc_vsync.h"
 
 inline size_t roundUpToPageSize(size_t x) {
     return (x + (PAGE_SIZE-1)) & ~(PAGE_SIZE-1);
@@ -68,10 +69,23 @@ struct fb_context_t {
 static int fb_setSwapInterval(struct framebuffer_device_t* dev,
                               int interval)
 {
-    fb_context_t* ctx = (fb_context_t*)dev;
-    if (interval < dev->minSwapInterval || interval > dev->maxSwapInterval)
-        return -EINVAL;
-    // FIXME: implement fb_setSwapInterval
+    if (interval < dev->minSwapInterval)
+    {
+        interval = dev->minSwapInterval;
+    }
+    else if (interval > dev->maxSwapInterval)
+    {
+        interval = dev->maxSwapInterval;
+    }
+
+    private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
+    m->swapInterval = interval;
+
+    if (0 == interval)
+        gralloc_vsync_disable(dev);
+    else
+        gralloc_vsync_enable(dev);
+
     return 0;
 }
 
@@ -256,7 +270,7 @@ int fb_device_open(hw_module_t const* module, const char* name,
     dev->common.version = 0;
     dev->common.module = const_cast<hw_module_t*>(module);
     dev->common.close = fb_close;
-    dev->setSwapInterval = 0;
+    dev->setSwapInterval = fb_setSwapInterval;
     dev->post = fb_post;
     dev->setUpdateRect = 0;
     dev->compositionComplete = 0;
